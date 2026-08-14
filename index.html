@@ -2,6 +2,9 @@
 <html lang="vi">
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sổ S2a-HKD</title>
+<script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-firestore-compat.js"></script>
 <script>
 /* xlsx-js-style 1.2.0 / SheetJS 0.18.5 - bundled for offline use */
 /* xlsx-js-style 1.2.0-beta @ 2022-04-05T01:40:48.447Z */
@@ -41,102 +44,98 @@ main{padding:22px 26px 36px;min-width:0;max-width:1500px}.page{display:none}.pag
 </section></main></div><div class="printall" id="printall" aria-hidden="true"></div>
 <script>
 const MAX=500,SIZE=50,REPORT_PAGE_SIZE=20,FINAL_SUMMARY_MAX_ROWS=9,PRINT_BATCH_SIZE=50,DB='so-s2a-hkd-data',DB_VERSION=2,state={batches:[],preview:[],total:0,fields:[],page:1,q:'',periodMode:'month',period:null,reportReady:false,reportByLocation:{},reportTotals:{},reportGrandTotal:0,reportPages:[],reportPage:1,reportStats:null,printBuilding:false,printNextBatchStart:null};
-// ============ ĐỒNG BỘ ĐÁM MÂY (dùng chung hạ tầng với app Thu Chi J24) ============
-const CLOUD_API_BASE='https://jolly-night-e734.dieunx2992001.workers.dev';
-const CLOUD_TOKEN_KEY='so2a_api_token';
-const CLOUD_DATASET='so2a:backup:v1';
-const CLOUD_AUTO_USER='J24';
-const CLOUD_AUTO_PASS='J24@123';
-const CLOUD_LAST_SYNC_KEY='so2a_last_synced_at';
-let CLOUD_READY=false,_cloudAutoLoginPromise=null,_cloudPushTimer=null,_cloudPushBusy=false,_cloudPushQueued=false;
-function cloudToken(){return localStorage.getItem(CLOUD_TOKEN_KEY)||''}
+// ============ ĐỒNG BỘ ĐÁM MÂY (Firebase Firestore, đăng nhập ẩn danh) ============
+const FIREBASE_CONFIG={apiKey:"AIzaSyBazxyzIrYd9J7T_UZ_g9K8sQ8lIYRIMv0",authDomain:"so2a-hkd.firebaseapp.com",projectId:"so2a-hkd",storageBucket:"so2a-hkd.firebasestorage.app",messagingSenderId:"1032653069552",appId:"1:1032653069552:web:4d811a84e314a7f5d6b635",measurementId:"G-S57Y5SN29P"};
+const FB_COLLECTION='so2a_batches';
+let FB_DB=null,FB_AUTH=null;
 function setSyncStatus(text){const el=document.getElementById('syncstatus');if(el)el.textContent=text}
-async function cloudApi(path,options={},withAuth=true){
-  const headers={...(options.headers||{})};
-  if(options.body&&!headers['Content-Type'])headers['Content-Type']='application/json';
-  if(withAuth){const t=cloudToken();if(!t){const e=new Error('Chưa đăng nhập đồng bộ');e.status=401;throw e}headers.Authorization='Bearer '+t}
-  let res;try{res=await fetch(CLOUD_API_BASE+path,{...options,headers})}catch(e){const err=new Error('Không kết nối được máy chủ đồng bộ.');err.status=0;throw err}
-  let data={};try{data=await res.json()}catch(e){}
-  if(!res.ok){const err=new Error(data.error||('Máy chủ báo lỗi '+res.status));err.status=res.status;throw err}
-  return data
+function fbInit(){
+  try{
+    if(typeof firebase==='undefined'){setSyncStatus('⚠ Không tải được thư viện đồng bộ.');return false}
+    firebase.initializeApp(FIREBASE_CONFIG);
+    FB_DB=firebase.firestore();FB_AUTH=firebase.auth();
+    return true
+  }catch(e){console.error('[firebase] init lỗi:',e);setSyncStatus('⚠ Không khởi tạo được kết nối đồng bộ.');return false}
 }
-async function cloudAutoLogin(){
-  if(_cloudAutoLoginPromise)return _cloudAutoLoginPromise;
-  _cloudAutoLoginPromise=(async()=>{
-    try{
-      const data=await cloudApi('/api/login',{method:'POST',body:JSON.stringify({username:CLOUD_AUTO_USER,password:CLOUD_AUTO_PASS})},false);
-      localStorage.setItem(CLOUD_TOKEN_KEY,data.token);CLOUD_READY=true;return true
-    }catch(e){console.warn('[cloud-sync] không đăng nhập được:',e&&e.message?e.message:e);CLOUD_READY=false;return false}
-    finally{_cloudAutoLoginPromise=null}
-  })();
-  return _cloudAutoLoginPromise
+async function fbEnsureAuth(){
+  if(!FB_AUTH)return false;
+  if(FB_AUTH.currentUser)return true;
+  try{await FB_AUTH.signInAnonymously();return true}
+  catch(e){console.error('[firebase] đăng nhập ẩn danh lỗi:',e);setSyncStatus('⚠ Không kết nối được máy chủ đồng bộ.');return false}
 }
-async function cloudEnsureAuth(){if(cloudToken())return true;return cloudAutoLogin()}
-async function cloudBuildPayload(){
-  const batches=await all('batches');
-  const payload={app:'so2a-cloud-sync',dbVersion:DB_VERSION,exportedAt:new Date().toISOString(),batches:[]};
-  for(const batch of batches){const compact=await getCompactRows(batch);payload.batches.push({meta:batch,compact})}
-  return payload
-}
-async function cloudPushNow(){
+async function fbPushBatch(batch){
+  const ok=await fbEnsureAuth();if(!ok)return false;
   try{
     setSyncStatus('☁ Đang đồng bộ lên máy chủ…');
-    const ok=await cloudEnsureAuth();if(!ok){setSyncStatus('⚠ Chưa kết nối máy chủ — dữ liệu chỉ lưu tạm trên máy');return false}
-    const payload=await cloudBuildPayload();
-    let res;
-    try{
-      res=await cloudApi('/api/data/'+encodeURIComponent(CLOUD_DATASET)+'/sync',{method:'POST',body:JSON.stringify({value:payload,deleteIds:[],deleteAll:false,updatedAt:payload.exportedAt})});
-    }catch(e){
-      if(e.status===401){await cloudAutoLogin();res=await cloudApi('/api/data/'+encodeURIComponent(CLOUD_DATASET)+'/sync',{method:'POST',body:JSON.stringify({value:payload,deleteIds:[],deleteAll:false,updatedAt:payload.exportedAt})})}
-      else throw e
-    }
-    localStorage.setItem(CLOUD_LAST_SYNC_KEY,res.updatedAt||payload.exportedAt);
+    const compact=await getCompactRows(batch);
+    const blob=await pack(JSON.stringify(compact));
+    const buf=await blob.arrayBuffer();
+    const doc={
+      fileName:batch.fileName,createdAt:batch.createdAt,rows:batch.rows,
+      sheets:batch.sheets||[],fields:batch.fields||INVOICE_FIELDS,symbols:batch.symbols||[],taxIds:batch.taxIds||[],
+      storage:batch.storage||'compact-gzip-v1',storedBytes:blob.size,
+      compactGzip:firebase.firestore.Blob.fromUint8Array(new Uint8Array(buf)),
+      updatedAt:new Date().toISOString()
+    };
+    await FB_DB.collection(FB_COLLECTION).doc(batch.id).set(doc);
     setSyncStatus('✓ Đã đồng bộ lúc '+new Date().toLocaleTimeString('vi-VN',{hour:'2-digit',minute:'2-digit'}));
     return true
-  }catch(e){console.error('[cloud-sync] push lỗi:',e);setSyncStatus('⚠ Đồng bộ lỗi: '+(e&&e.message?e.message:'không xác định'));return false}
+  }catch(e){console.error('[firebase] push lỗi:',e);setSyncStatus('⚠ Đồng bộ lỗi: '+(e&&e.message?e.message:'không xác định'));return false}
 }
-function cloudPush(){
-  // Gộp nhiều thay đổi liên tiếp lại, chỉ gửi lên máy chủ 1 lần sau 700ms yên tĩnh.
-  if(_cloudPushTimer)clearTimeout(_cloudPushTimer);
-  _cloudPushTimer=setTimeout(async()=>{
-    _cloudPushTimer=null;
-    if(_cloudPushBusy){_cloudPushQueued=true;return}
-    _cloudPushBusy=true;
-    try{await cloudPushNow()}finally{_cloudPushBusy=false;if(_cloudPushQueued){_cloudPushQueued=false;cloudPush()}}
-  },700)
+async function fbDeleteBatch(id){
+  const ok=await fbEnsureAuth();if(!ok)return false;
+  try{await FB_DB.collection(FB_COLLECTION).doc(id).delete();return true}
+  catch(e){console.error('[firebase] xóa lỗi:',e);setSyncStatus('⚠ Xóa trên máy chủ lỗi: '+(e&&e.message?e.message:'không xác định'));return false}
 }
-async function cloudPullAndMerge(){
+async function fbDeleteAll(ids){
+  const ok=await fbEnsureAuth();if(!ok||!ids.length)return false;
   try{
-    setSyncStatus('☁ Đang kiểm tra dữ liệu trên máy chủ…');
-    const ok=await cloudEnsureAuth();if(!ok){setSyncStatus('⚠ Chưa kết nối máy chủ — đang dùng dữ liệu trên máy');return false}
-    let data;
-    try{data=await cloudApi('/api/data/'+encodeURIComponent(CLOUD_DATASET))}
-    catch(e){if(e.status===401){await cloudAutoLogin();data=await cloudApi('/api/data/'+encodeURIComponent(CLOUD_DATASET))}else throw e}
-    if(!data.found||!data.value||!Array.isArray(data.value.batches)){
-      setSyncStatus('✓ Đã kết nối máy chủ đồng bộ');
-      // Chưa có dữ liệu trên máy chủ — đẩy dữ liệu hiện có trên máy này lên (nếu có).
-      if((await all('batches')).length)cloudPush();
-      return false
+    for(let i=0;i<ids.length;i+=400){
+      const chunk=ids.slice(i,i+400),op=FB_DB.batch();
+      chunk.forEach(id=>op.delete(FB_DB.collection(FB_COLLECTION).doc(id)));
+      await op.commit();
     }
-    const lastSynced=localStorage.getItem(CLOUD_LAST_SYNC_KEY)||'';
-    const cloudUpdatedAt=data.updatedAt||data.value.exportedAt||'';
-    const localBatches=await all('batches');
-    const needMerge=cloudUpdatedAt&&cloudUpdatedAt!==lastSynced;
-    if(!needMerge&&localBatches.length){setSyncStatus('✓ Dữ liệu đã đồng bộ');return false}
-    let restored=0;
-    for(const item of data.value.batches){
-      if(!item||!item.meta||!item.meta.id||!Array.isArray(item.compact))continue;
-      await save(item.meta,item.compact);restored++
-    }
-    if(cloudUpdatedAt)localStorage.setItem(CLOUD_LAST_SYNC_KEY,cloudUpdatedAt);
-    setSyncStatus('✓ Đã đồng bộ '+fmt(restored)+' lần import từ máy chủ');
-    return restored>0
-  }catch(e){console.error('[cloud-sync] pull lỗi:',e);setSyncStatus('⚠ Không đọc được dữ liệu máy chủ: '+(e&&e.message?e.message:'lỗi không xác định'));return false}
+    return true
+  }catch(e){console.error('[firebase] xóa toàn bộ lỗi:',e);setSyncStatus('⚠ Xóa trên máy chủ lỗi: '+(e&&e.message?e.message:'không xác định'));return false}
 }
-async function cloudInit(){
+async function fbApplyRemoteDoc(id,data){
+  try{
+    const bytes=data.compactGzip.toUint8Array();
+    const blob=new Blob([bytes],{type:'application/gzip'});
+    const compact=JSON.parse(await unpack(blob));
+    const meta={id,fileName:data.fileName,createdAt:data.createdAt,rows:data.rows,sheets:data.sheets||[],fields:data.fields||INVOICE_FIELDS,symbols:data.symbols||[],taxIds:data.taxIds||[],storage:data.storage||'compact-gzip-v1',storedBytes:data.storedBytes||0};
+    await save(meta,compact);
+  }catch(e){console.error('[firebase] áp dữ liệu từ máy chủ lỗi:',e)}
+}
+function fbPush(batch){fbPushBatch(batch)}
+function fbDelete(id){fbDeleteBatch(id)}
+function fbClearAll(ids){fbDeleteAll(ids)}
+async function fbStart(){
+  if(!fbInit())return;
+  const ok=await fbEnsureAuth();if(!ok)return;
   setSyncStatus('☁ Đang kết nối máy chủ đồng bộ…');
-  const changed=await cloudPullAndMerge();
-  if(changed)await reload();
+  let firstSnapshot=true;
+  FB_DB.collection(FB_COLLECTION).onSnapshot(async snapshot=>{
+    if(snapshot.metadata.hasPendingWrites)return;
+    if(firstSnapshot){
+      firstSnapshot=false;
+      if(snapshot.empty){
+        const localBatches=await all('batches');
+        if(localBatches.length){
+          setSyncStatus('☁ Đang tải dữ liệu hiện có lên máy chủ lần đầu…');
+          for(const b of localBatches)await fbPushBatch(b);
+        }
+        setSyncStatus('✓ Đã kết nối máy chủ đồng bộ');
+        return;
+      }
+    }
+    let changed=false;
+    for(const change of snapshot.docChanges()){
+      if(change.type==='removed'){await remove(change.doc.id);changed=true}
+      else{await fbApplyRemoteDoc(change.doc.id,change.doc.data());changed=true}
+    }
+    if(changed){await reload();setSyncStatus('✓ Đã đồng bộ lúc '+new Date().toLocaleTimeString('vi-VN',{hour:'2-digit',minute:'2-digit'}))}
+  },err=>{console.error('[firebase] lắng nghe lỗi:',err);setSyncStatus('⚠ Mất kết nối máy chủ đồng bộ: '+(err&&err.message?err.message:''))});
 }
 
 const INVOICE_FIELDS=['STT','Ký hiệu mẫu số','Ký hiệu hóa đơn','Số hóa đơn','Ngày lập','MST người bán/MST người xuất hàng','Tên người bán/Tên người xuất hàng','MST người mua/MST người nhận hàng','Tên người mua/Tên người nhận hàng','Địa chỉ người mua','Căn cước công dân','Tổng tiền chưa thuế','Tổng tiền thuế','Tổng tiền chiết khấu thương mại','Tổng tiền thanh toán','Trạng thái hóa đơn','Kết quả kiểm tra hóa đơn'];
@@ -174,7 +173,7 @@ async function remove(id){const d=await db();await new Promise((ok,no)=>{const t
 async function clearAll(){const d=await db();await new Promise((ok,no)=>{const t=d.transaction(['rows','batches','batchData'],'readwrite');t.objectStore('rows').clear();t.objectStore('batches').clear();t.objectStore('batchData').clear();t.oncomplete=ok;t.onerror=()=>no(t.error)});d.close()}
 async function getCompactRows(batch){const saved=await getBatchData(batch.id);if(saved&&saved.blob)return JSON.parse(await unpack(saved.blob));return (await legacyAll(batch.id)).map(row=>[row.__sheet,...INVOICE_FIELDS.map(field=>row[field])])}
 async function exportBackup(){if(!state.batches.length)return toast('Chưa có dữ liệu để sao lưu.');const btn=document.getElementById('backupbtn');try{if(btn)btn.disabled=true;toast('Đang chuẩn bị file sao lưu…');const batches=await all('batches');const payload={app:'so-s2a-hkd-backup',dbVersion:DB_VERSION,exportedAt:new Date().toISOString(),batches:[]};for(const batch of batches){const compact=await getCompactRows(batch);payload.batches.push({meta:batch,compact})}const json=JSON.stringify(payload);const blob=new Blob([json],{type:'application/json'});const url=URL.createObjectURL(blob);const a=document.createElement('a');const now=new Date();const stamp=now.getFullYear()+String(now.getMonth()+1).padStart(2,'0')+String(now.getDate()).padStart(2,'0')+'-'+String(now.getHours()).padStart(2,'0')+String(now.getMinutes()).padStart(2,'0');a.href=url;a.download='sao-luu-so-s2a-hkd-'+stamp+'.json';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),4000);toast('Đã tải file sao lưu ('+fmt(batches.length)+' lần import).')}catch(e){console.error(e);toast('Không tạo được file sao lưu: '+(e&&e.message?e.message:'Lỗi không xác định'))}finally{if(btn)btn.disabled=false}}
-async function restoreBackup(file){if(!file)return;const btn=document.getElementById('restorebtn');try{if(btn)btn.disabled=true;toast('Đang đọc file sao lưu…');const text=await file.text();let payload;try{payload=JSON.parse(text)}catch(_){throw new Error('File không đúng định dạng JSON.')}if(!payload||!Array.isArray(payload.batches))throw new Error('File sao lưu không hợp lệ.');if(!payload.batches.length){toast('File sao lưu không có dữ liệu.');return}if(!confirm('Phục hồi '+fmt(payload.batches.length)+' lần import từ file sao lưu vào máy này?\nDữ liệu trùng ID sẽ được ghi đè, dữ liệu khác vẫn được giữ nguyên.'))return;let restored=0;for(const item of payload.batches){if(!item||!item.meta||!item.meta.id||!Array.isArray(item.compact))continue;await save(item.meta,item.compact);restored++}await reload();if(restored)cloudPush();toast('Đã phục hồi '+fmt(restored)+' lần import từ file sao lưu.')}catch(e){console.error(e);toast('Không phục hồi được: '+(e&&e.message?e.message:'Lỗi không xác định'))}finally{if(btn)btn.disabled=false}}
+async function restoreBackup(file){if(!file)return;const btn=document.getElementById('restorebtn');try{if(btn)btn.disabled=true;toast('Đang đọc file sao lưu…');const text=await file.text();let payload;try{payload=JSON.parse(text)}catch(_){throw new Error('File không đúng định dạng JSON.')}if(!payload||!Array.isArray(payload.batches))throw new Error('File sao lưu không hợp lệ.');if(!payload.batches.length){toast('File sao lưu không có dữ liệu.');return}if(!confirm('Phục hồi '+fmt(payload.batches.length)+' lần import từ file sao lưu vào máy này?\nDữ liệu trùng ID sẽ được ghi đè, dữ liệu khác vẫn được giữ nguyên.'))return;let restored=0;const restoredMetas=[];for(const item of payload.batches){if(!item||!item.meta||!item.meta.id||!Array.isArray(item.compact))continue;await save(item.meta,item.compact);restoredMetas.push(item.meta);restored++}await reload();restoredMetas.forEach(fbPush);toast('Đã phục hồi '+fmt(restored)+' lần import từ file sao lưu.')}catch(e){console.error(e);toast('Không phục hồi được: '+(e&&e.message?e.message:'Lỗi không xác định'))}finally{if(btn)btn.disabled=false}}
 function txt(v){if(v==null)return'';if(v instanceof Date&&!isNaN(v)){return String(v.getDate()).padStart(2,'0')+'/'+String(v.getMonth()+1).padStart(2,'0')+'/'+v.getFullYear()}return String(v).trim()}
 function fmt(n){return new Intl.NumberFormat('vi-VN').format(n||0)}function esc(v){return txt(v).replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]))}function toast(m){document.querySelector('.toast')?.remove();const e=document.createElement('div');e.className='toast';e.textContent=m;document.body.appendChild(e);setTimeout(()=>e.remove(),3400)}
 function dateToISO(value){const s=txt(value);let m=s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);if(m)return m[3]+'-'+m[2].padStart(2,'0')+'-'+m[1].padStart(2,'0');m=s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);if(m)return m[1]+'-'+m[2].padStart(2,'0')+'-'+m[3].padStart(2,'0');return''}
@@ -199,7 +198,7 @@ let xlsxWorker=null;
 function getXlsxWorker(){if(xlsxWorker)return xlsxWorker;const workerSrc=`importScripts('https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js');function fix(ws){let maxR=0,maxC=0,minR=0,minC=0,found=false;Object.keys(ws).forEach(a=>{if(a[0]==='!')return;const c=XLSX.utils.decode_cell(a);if(!found){minR=c.r;minC=c.c;found=true}maxR=Math.max(maxR,c.r);maxC=Math.max(maxC,c.c);minR=Math.min(minR,c.r);minC=Math.min(minC,c.c)});if(found)ws['!ref']=XLSX.utils.encode_range({s:{r:minR,c:minC},e:{r:maxR,c:maxC}})}function unmerge(ws){const merges=ws['!merges'];if(!merges)return;merges.forEach(g=>{const a=XLSX.utils.encode_cell({r:g.s.r,c:g.s.c}),cell=ws[a];if(!cell)return;for(let r=g.s.r;r<=g.e.r;r++)for(let c=g.s.c;c<=g.e.c;c++){const p=XLSX.utils.encode_cell({r,c});if(p!==a)ws[p]={...cell}}})}onmessage=e=>{try{const wb=XLSX.read(e.data.buffer,{type:'array',cellDates:true}),sheets=wb.SheetNames.map(name=>{const ws=wb.Sheets[name];fix(ws);unmerge(ws);return{name,matrix:XLSX.utils.sheet_to_json(ws,{header:1,raw:true,defval:'',blankrows:false})}});postMessage({ok:true,sheets})}catch(err){postMessage({ok:false,error:err.message||String(err)})}}`;try{xlsxWorker=new Worker(URL.createObjectURL(new Blob([workerSrc],{type:'application/javascript'})))}catch(e){xlsxWorker=null}return xlsxWorker}
 function readWorkbookSync(file){return file.arrayBuffer().then(buffer=>{const wb=XLSX.read(buffer,{type:'array',cellDates:true});return wb.SheetNames.map(name=>{const ws=wb.Sheets[name];fixSheetRange(ws);unmergeFillSheet(ws);return{name,matrix:XLSX.utils.sheet_to_json(ws,{header:1,raw:true,defval:'',blankrows:false})}})})}
 function readWorkbook(file){if(location.protocol==='file:')return readWorkbookSync(file);return new Promise((resolve,reject)=>{const worker=getXlsxWorker();if(!worker){readWorkbookSync(file).then(resolve,reject);return}const done=()=>{worker.removeEventListener('message',onMessage);worker.removeEventListener('error',onError)},onMessage=e=>{done();if(e.data&&e.data.ok)resolve(e.data.sheets);else reject(new Error(e.data?.error||'Lỗi đọc Excel trong luồng nền.'))},onError=()=>{done();try{worker.terminate()}catch(e){}xlsxWorker=null;readWorkbookSync(file).then(resolve,reject)};worker.addEventListener('message',onMessage);worker.addEventListener('error',onError);file.arrayBuffer().then(buffer=>worker.postMessage({buffer},[buffer])).catch(reject)})}
-async function importFiles(files){if(!files.length)return;busy(true,'Đang đọc '+files.length+' tệp… Tệp lớn có thể mất 10-30 giây');await new Promise(resolve=>requestAnimationFrame(resolve));let added=0;try{if(typeof XLSX==='undefined')throw new Error('Không khởi động được bộ đọc Excel tích hợp.');for(const file of files){if(!/\.(xlsx|xls|csv)$/i.test(file.name))continue;const id=Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,8),rows=[],sheets=[];for(const source of await readWorkbook(file)){const p=parseMatrix(source.matrix,source.name);if(p.recognized&&p.rows.length){for(const row of p.rows)rows.push(row);sheets.push({name:source.name,rows:p.rows.length})}}if(!rows.length){toast('File '+file.name+' không có đủ 17 trường hóa đơn theo mẫu.');continue}const symbols=[...new Set(rows.map(row=>fullInvoiceSymbol(row[2],row[3])).filter(Boolean))].sort(),taxIds=[...new Set(rows.map(row=>normalizeTaxId(row[6])).filter(Boolean))].sort();busy(true,'Đang nén và lưu '+fmt(rows.length)+' hóa đơn…');await save({id,fileName:file.name,createdAt:Date.now(),rows:rows.length,sheets,fields:INVOICE_FIELDS,symbols,taxIds},rows);added+=rows.length}await reload();if(added)cloudPush();toast('Bản v17 đã import '+fmt(added)+' hóa đơn với đủ 17 trường.')}catch(e){console.error(e);const reason=e&&e.message?e.message:(e&&e.name?e.name:'Lỗi không xác định');toast('Bản v17 không import được: '+reason.slice(0,180))}finally{busy(false)}}
+async function importFiles(files){if(!files.length)return;busy(true,'Đang đọc '+files.length+' tệp… Tệp lớn có thể mất 10-30 giây');await new Promise(resolve=>requestAnimationFrame(resolve));let added=0;const newBatchMetas=[];try{if(typeof XLSX==='undefined')throw new Error('Không khởi động được bộ đọc Excel tích hợp.');for(const file of files){if(!/\.(xlsx|xls|csv)$/i.test(file.name))continue;const id=Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,8),rows=[],sheets=[];for(const source of await readWorkbook(file)){const p=parseMatrix(source.matrix,source.name);if(p.recognized&&p.rows.length){for(const row of p.rows)rows.push(row);sheets.push({name:source.name,rows:p.rows.length})}}if(!rows.length){toast('File '+file.name+' không có đủ 17 trường hóa đơn theo mẫu.');continue}const symbols=[...new Set(rows.map(row=>fullInvoiceSymbol(row[2],row[3])).filter(Boolean))].sort(),taxIds=[...new Set(rows.map(row=>normalizeTaxId(row[6])).filter(Boolean))].sort();busy(true,'Đang nén và lưu '+fmt(rows.length)+' hóa đơn…');const newMeta={id,fileName:file.name,createdAt:Date.now(),rows:rows.length,sheets,fields:INVOICE_FIELDS,symbols,taxIds};await save(newMeta,rows);newBatchMetas.push(newMeta);added+=rows.length}await reload();newBatchMetas.forEach(fbPush);toast('Bản v17 đã import '+fmt(added)+' hóa đơn với đủ 17 trường.')}catch(e){console.error(e);const reason=e&&e.message?e.message:(e&&e.name?e.name:'Lỗi không xác định');toast('Bản v17 không import được: '+reason.slice(0,180))}finally{busy(false)}}
 function busy(on,m){document.getElementById('drop').classList.toggle('busy',on);document.getElementById('droptitle').textContent=on?m:'Kéo thả file danh sách hóa đơn vào đây';document.getElementById('dropico').innerHTML=on?'<span class="spinner"></span>':'⇧';document.getElementById('files').disabled=on}
 async function reload(){state.batches=(await all('batches')).sort((a,b)=>a.createdAt-b.createdAt);state.total=state.batches.reduce((sum,b)=>sum+(Number(b.rows)||0),0);state.preview=await loadPreview(state.batches);state.fields=state.batches.length?INVOICE_FIELDS:[];state.page=1;state.reportReady=false;state.reportByLocation={};state.reportTotals={};state.reportGrandTotal=0;state.reportPages=[];state.reportPage=1;state.reportStats=null;const notice=document.getElementById('reportnotice');if(notice)notice.innerHTML='<b>Sẵn sàng lên sổ.</b> Chọn hộ kinh doanh và kỳ kê khai rồi bấm “Tổng hợp dữ liệu”. Web tự gán địa điểm theo MST + ký hiệu hóa đơn. Dữ liệu đã import: <b id="reportcount">'+fmt(state.total)+'</b> dòng.';render()}
 function render(){kf.textContent=fmt(state.batches.length);kr.textContent=fmt(state.total);kc.textContent=fmt(state.fields.length);ks.textContent=fmt(state.batches.reduce((s,b)=>s+(b.sheets||[]).length,0));const count=document.getElementById('reportcount');if(count)count.textContent=fmt(state.total);renderBatches();renderTable();renderLocationMappings();renderReport()}
@@ -376,7 +375,7 @@ function setPeriodMode(mode){state.periodMode=mode;const isMonth=mode==='month';
 function selectedPeriod(){if(state.periodMode==='month'){const parts=reportmonth.value.split('-'),year=Number(parts[0]),month=Number(parts[1]);if(parts.length!==2||!year||month<1||month>12)return null;const lastDay=new Date(year,month,0).getDate(),mm=String(month).padStart(2,'0');return{mode:'month',label:'Tháng '+month+' năm '+year,from:year+'-'+mm+'-01',to:year+'-'+mm+'-'+String(lastDay).padStart(2,'0')}}const year=Number(quarterYear.value),quarter=Number(quarterSelect.value);if(!year||quarter<1||quarter>4)return null;const firstMonth=(quarter-1)*3+1,lastMonth=firstMonth+2,lastDay=new Date(year,lastMonth,0).getDate(),roman=['','I','II','III','IV'];return{mode:'quarter',label:'Quý '+roman[quarter]+' năm '+year,from:year+'-'+String(firstMonth).padStart(2,'0')+'-01',to:year+'-'+String(lastMonth).padStart(2,'0')+'-'+String(lastDay).padStart(2,'0')}}
 function applyPeriod(showToast=true){const chosen=selectedPeriod();if(!chosen){if(showToast)toast('Vui lòng chọn tháng hoặc một kỳ quý hợp lệ.');return false}const changed=state.period&&(state.period.from!==chosen.from||state.period.to!==chosen.to);state.period=chosen;periodElement.textContent='Kỳ kê khai: '+chosen.label;periodstatus.textContent='Kỳ đang chọn: '+chosen.label;reportbody.dataset.periodFrom=chosen.from;reportbody.dataset.periodTo=chosen.to;if(changed)invalidateReport('Kỳ kê khai đã đổi sang '+chosen.label+'.');if(showToast)toast('Đã lọc kỳ kê khai: '+chosen.label+'.');return true}
 document.querySelectorAll('.nav').forEach(b=>b.onclick=()=>{document.querySelectorAll('.nav').forEach(x=>x.classList.remove('active'));b.classList.add('active');document.querySelectorAll('.page').forEach(x=>x.classList.remove('active'));document.getElementById('page-'+b.dataset.page).classList.add('active')});files.onchange=e=>{importFiles([...e.target.files]);e.target.value=''};['dragenter','dragover'].forEach(t=>drop.addEventListener(t,e=>{e.preventDefault();drop.classList.add('over')}));['dragleave','drop'].forEach(t=>drop.addEventListener(t,e=>{e.preventDefault();drop.classList.remove('over')}));drop.ondrop=e=>importFiles([...e.dataTransfer.files]);search.oninput=e=>{state.q=e.target.value;state.page=1;renderTable()};datafirst.onclick=()=>goToDataPage(1);prev.onclick=()=>goToDataPage(state.page-1);next.onclick=()=>goToDataPage(state.page+1);datalast.onclick=()=>goToDataPage(Math.ceil(filtered().length/SIZE));
-undo.onclick=async()=>{const b=state.batches.at(-1);if(!b)return toast('Chưa có lần import nào để xóa.');if(confirm('Xóa lần import cuối: '+b.fileName+'?')){await remove(b.id);await reload();cloudPush();toast('Đã xóa lần import cuối.')}};clear.onclick=async()=>{if(!state.total)return toast('Chưa có dữ liệu để xóa.');if(confirm('Xóa toàn bộ dữ liệu đã import trên trình duyệt này?')){await clearAll();await reload();cloudPush();toast('Đã xóa toàn bộ dữ liệu.')}};backupbtn.onclick=exportBackup;restorebtn.onclick=()=>restorefile.click();restorefile.onchange=e=>{const f=e.target.files[0];e.target.value='';if(f)restoreBackup(f)};reportmonth.onchange=()=>setPeriodMode('month');quarterSelect.onchange=()=>setPeriodMode('quarter');quarterYear.onchange=()=>setPeriodMode('quarter');reportbusiness.onchange=()=>updateBusinessUI(true);applyperiod.onclick=()=>applyPeriod(true);reportlocation.onchange=()=>{state.reportPage=1;renderReport()};aggregate.onclick=buildReportData;document.getElementById('printallbtn').onclick=printSelectedBatch;document.getElementById('printallonce').onclick=printAllOnce;document.getElementById('exportexcel').onclick=exportReportExcel;document.getElementById('reportfirst').onclick=()=>goToReportPage(1);document.getElementById('reportprev').onclick=()=>goToReportPage(state.reportPage-1);document.getElementById('reportnext').onclick=()=>goToReportPage(state.reportPage+1);document.getElementById('reportlast').onclick=()=>goToReportPage(state.reportPages.length);window.addEventListener('beforeprint',()=>applyPeriod(false));window.addEventListener('afterprint',()=>{if(state.printBuilding)cleanupPrintAll()});
+undo.onclick=async()=>{const b=state.batches.at(-1);if(!b)return toast('Chưa có lần import nào để xóa.');if(confirm('Xóa lần import cuối: '+b.fileName+'?')){await remove(b.id);await reload();fbDelete(b.id);toast('Đã xóa lần import cuối.')}};clear.onclick=async()=>{if(!state.total)return toast('Chưa có dữ liệu để xóa.');if(confirm('Xóa toàn bộ dữ liệu đã import trên trình duyệt này?')){const idsToDelete=state.batches.map(x=>x.id);await clearAll();await reload();fbClearAll(idsToDelete);toast('Đã xóa toàn bộ dữ liệu.')}};backupbtn.onclick=exportBackup;restorebtn.onclick=()=>restorefile.click();restorefile.onchange=e=>{const f=e.target.files[0];e.target.value='';if(f)restoreBackup(f)};reportmonth.onchange=()=>setPeriodMode('month');quarterSelect.onchange=()=>setPeriodMode('quarter');quarterYear.onchange=()=>setPeriodMode('quarter');reportbusiness.onchange=()=>updateBusinessUI(true);applyperiod.onclick=()=>applyPeriod(true);reportlocation.onchange=()=>{state.reportPage=1;renderReport()};aggregate.onclick=buildReportData;document.getElementById('printallbtn').onclick=printSelectedBatch;document.getElementById('printallonce').onclick=printAllOnce;document.getElementById('exportexcel').onclick=exportReportExcel;document.getElementById('reportfirst').onclick=()=>goToReportPage(1);document.getElementById('reportprev').onclick=()=>goToReportPage(state.reportPage-1);document.getElementById('reportnext').onclick=()=>goToReportPage(state.reportPage+1);document.getElementById('reportlast').onclick=()=>goToReportPage(state.reportPages.length);window.addEventListener('beforeprint',()=>applyPeriod(false));window.addEventListener('afterprint',()=>{if(state.printBuilding)cleanupPrintAll()});
 fieldchips.innerHTML=INVOICE_FIELDS.map(field=>'<span class="fieldchip">'+esc(field)+'</span>').join('');
-reportbusiness.innerHTML=BUSINESSES.map(business=>'<option value="'+business.mst+'">'+esc(business.name+' - MST '+business.mst)+'</option>').join('');reportbusiness.value=BUSINESSES[0].mst;updateBusinessUI(false);quarterYear.innerHTML=Array.from({length:81},(_,i)=>'<option value="'+(2020+i)+'">'+(2020+i)+'</option>').join('');quarterYear.value=reportmonth.value.slice(0,4)||String(new Date().getFullYear());quarterSelect.value='1';setPeriodMode('month');applyPeriod(false);if(typeof XLSX==='undefined')toast('Không khởi động được bộ đọc Excel tích hợp.');reload().catch(e=>{console.error(e);toast('Vui lòng mở trang bằng Chrome hoặc Edge.');render()});cloudInit().catch(e=>console.error(e));
+reportbusiness.innerHTML=BUSINESSES.map(business=>'<option value="'+business.mst+'">'+esc(business.name+' - MST '+business.mst)+'</option>').join('');reportbusiness.value=BUSINESSES[0].mst;updateBusinessUI(false);quarterYear.innerHTML=Array.from({length:81},(_,i)=>'<option value="'+(2020+i)+'">'+(2020+i)+'</option>').join('');quarterYear.value=reportmonth.value.slice(0,4)||String(new Date().getFullYear());quarterSelect.value='1';setPeriodMode('month');applyPeriod(false);if(typeof XLSX==='undefined')toast('Không khởi động được bộ đọc Excel tích hợp.');reload().catch(e=>{console.error(e);toast('Vui lòng mở trang bằng Chrome hoặc Edge.');render()});fbStart().catch(e=>console.error(e));
 </script></body></html>
